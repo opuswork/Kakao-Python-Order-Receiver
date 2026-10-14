@@ -1,0 +1,10 @@
+{
+  "intent": {"id": "test-block", "name": "폴백 블록"},
+  "bot": {"id": "test-bot", "name": "주문 테스트"},
+  "action": {"id": "test-skill", "name": "장유 주문접수", "params": {}},
+  "userRequest": {
+    "timezone": "Asia/Seoul",
+    "utterance": "신선유통, 2026-10-21, 1급진간장 1.8리터 300박스",
+    "user": {"id": "test-user", "type": "botUserKey"}
+  }
+}

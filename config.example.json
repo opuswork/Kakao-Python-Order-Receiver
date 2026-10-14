@@ -1,0 +1,26 @@
+{
+  "bindings": {
+    "REPLACE_WITH_REAL_BOT_USER_KEY": {
+      "userId": 0,
+      "allowed_partner_ids": [
+        0
+      ],
+      "storeRegion": "REPLACE_WITH_NAMBU_JUNGBU_OR_SEOBU"
+    }
+  },
+  "price_field": "wholesalePrice",
+  "shipment": {
+    "estimated_time": "09:00:00+09:00",
+    "carrier": ""
+  },
+  "product_map": [
+    {
+      "match": "1급진간장\\s*1[.]8\\s*(?:리터|L)",
+      "input_unit": "개",
+      "code": "8809240150143",
+      "catalog_unit": "개",
+      "quantity_multiplier": 1
+    }
+  ],
+  "partner_source": "api"
+}
