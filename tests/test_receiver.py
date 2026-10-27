@@ -71,6 +71,27 @@ def test_year_and_multiple_items():
         parse_order('신선유통, 9월 21일, 진간장 3박스', dt.date(2026, 10, 14))
 
 
+@pytest.mark.parametrize('text', [
+    '11월 10일, 1급진간장 1.8리터 10개, 신선유통 주문합니다.(테스트)',
+    '1급진간장 1.8리터 10개, 신선유통, 11/10 납품',
+    '신선유통, 11월 10일까지, 1급진간장 1.8리터 10개 주문 부탁드립니다!',
+])
+def test_any_part_order_and_courtesy_endings(text):
+    p = parse_order(text, dt.date(2026, 10, 27))
+    assert p == {'company': '신선유통', 'ship_date': '2026-11-10',
+                 'items': [{'name': '1급진간장 1.8리터', 'qty': 10, 'unit': '개'}]}
+
+
+@pytest.mark.parametrize('text', [
+    '신선유통, 11월 10일, 11월 11일, 진간장 3박스',
+    '신선유통, 한빛상회, 11월 10일, 진간장 3박스',
+    '신선유통, 11월 10일 주문합니다',
+])
+def test_reordered_inputs_still_reject_ambiguity(text):
+    with pytest.raises(OrderError):
+        parse_order(text, dt.date(2026, 10, 27))
+
+
 def configuration():
     return {'partner_source': 'config', 'bindings': {'u1': {'userId': 123, 'allowed_partner_ids': [7], 'storeRegion': 'NAMBU'}},
             'partners': [{'id': 7, 'userId': 123, 'name': '신선유통', 'contactName': '테스트',
