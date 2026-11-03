@@ -181,6 +181,19 @@ def test_product_matching_rules():
     assert match_products(CATALOG, {'name': '명절 선물세트 1호', 'unit': '박스'}) == []
 
 
+def test_catalog_names_with_bare_units_and_tong():
+    catalog = [{'code': 'F', 'productName': '생명물간장 860mL(박스)', 'category': '일반품'},
+               {'code': 'G', 'productName': '생명물간장 120mL(70개입)박스', 'category': '일반품'},
+               {'code': 'H', 'productName': '1급진간장 500mL박스', 'category': '일반품'},
+               {'code': 'I', 'productName': '* 생명물간장 13L(개)', 'category': '일반품'}]
+    codes = lambda name, unit: [p['code'] for p in match_products(catalog, {'name': name, 'unit': unit})]
+    assert codes('생명물간장 860ml', '통') == ['F']
+    assert codes('생명물간장 120ml', '박스') == codes('생명물간장 120ml', '통') == ['G']
+    assert codes('1급진간장 500ml', '박스') == ['H']
+    assert codes('생명물간장 13L', '통') == ['I']
+    assert codes('생명물간장 860ml', '병') == []
+
+
 def test_church_search_matches_order_form():
     assert [c['name'] for c in search_churches(CHURCHES, '5')] == ['원주']
     assert [c['name'] for c in search_churches(CHURCHES, '서울')] == ['서대문남', '서대문북']

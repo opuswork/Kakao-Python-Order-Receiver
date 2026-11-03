@@ -13,29 +13,41 @@ from decimal import Decimal, InvalidOperation
 from orders import KST, STORES, OrderError
 
 UNIT = re.compile(r'[（(]\s*(박스|개|병|통|팩|봉|세트)\s*[）)]')
+# Some names end in a bare unit: '생명물간장 120mL(70개입)박스', '1급진간장 500mL박스'.
+BARE_UNIT = re.compile(r'(박스|개|병|통|팩|봉|세트)\s*$')
 DIRECTOR_TYPES = {'GWANJANG', 'CHONGMU'}
 
 
 def norm(name):
     name = (name or '').lower().strip().lstrip('*').strip()
-    name = UNIT.sub('', name).replace('리터', 'l').replace('밀리', 'm')
+    name = BARE_UNIT.sub('', UNIT.sub('', name)).replace('리터', 'l').replace('밀리', 'm')
     return re.sub(r'[\s()（）]', '', name)
 
 
 def unit_of(product):
-    units = set(UNIT.findall((product.get('productName') or '') + ' ' + str(product.get('spec') or '')))
+    name = (product.get('productName') or '').strip()
+    units = set(UNIT.findall(name + ' ' + str(product.get('spec') or '')))
+    if not units and BARE_UNIT.search(name):
+        units = {BARE_UNIT.search(name).group(1)}
     return units.pop() if len(units) == 1 else None
+
+
+def unit_fits(product, unit):
+    # Customers write 통 for a product's own unit: '13L 2통' is (개), '1.8L 3통' is (박스).
+    have = unit_of(product)
+    return have == unit or (unit == '통' and have is not None)
 
 
 def match_products(catalog, item):
     """Catalog rows for a chat item. Exact name first, then names containing it.
 
     The unit must equal the product's (박스)/(개)… annotation; there is no box↔ea conversion.
+    통 accepts either; the preview shows the product's real unit before confirmation.
     선물세트 needs a 인사장 and stays in the app.
     """
     wanted = norm(item['name'])
     rows = [p for p in catalog if p.get('productName') and p.get('openStock') is not False
-            and p.get('category') != '선물세트' and unit_of(p) == item['unit']]
+            and p.get('category') != '선물세트' and unit_fits(p, item['unit'])]
     exact = [p for p in rows if norm(p['productName']) == wanted]
     found = exact or ([p for p in rows if wanted in norm(p['productName'])] if len(wanted) >= 2 else [])
     names = {}
