@@ -26,8 +26,19 @@ class Store:
                   expires_at=now()+interval '15 minutes'
                 WHERE kakao_receiver_orders.status='cancelled' ''',
                 (identifier, owner, fingerprint, Jsonb(payload), preview))
+            # A reshown draft becomes the one the next '주문 확정' button refers to (see latest()).
+            await conn.execute('''UPDATE kakao_receiver_orders SET updated_at=now()
+                WHERE fingerprint=%s AND owner=%s AND status='draft' ''', (fingerprint, owner))
             cur = await conn.execute('SELECT *, expires_at>now() AS fresh FROM kakao_receiver_orders WHERE fingerprint=%s AND owner=%s',
                                      (fingerprint, owner))
+            return await cur.fetchone()
+
+    async def latest(self, owner):
+        # Buttons say just '주문 확정'; Kakao shows quick replies only under the newest message,
+        # so they mean the draft shown last.
+        async with await self.connect() as conn:
+            cur = await conn.execute('''SELECT *, expires_at > now() AS fresh FROM kakao_receiver_orders
+                WHERE owner=%s ORDER BY updated_at DESC LIMIT 1''', (owner,))
             return await cur.fetchone()
 
     async def get(self, identifier, owner):
@@ -112,11 +123,19 @@ class MemoryStore:
     async def draft(self, owner, fingerprint, payload, preview, identifier):
         old = next((r for r in self.rows.values() if r['fingerprint'] == fingerprint), None)
         if old and old['status'] != 'cancelled':
+            if old['status'] == 'draft':
+                self.rows[old['id']] = self.rows.pop(old['id'])  # Reshown: latest() order.
             return copy.deepcopy(old)
         row = dict(id=identifier, owner=owner, fingerprint=fingerprint, payload=payload, preview=preview,
                    status='draft', order_no=None, fresh=True)
+        if old:
+            del self.rows[old['id']]  # Postgres reuses the cancelled row for the same fingerprint.
         self.rows[identifier] = row
         return copy.deepcopy(row)
+
+    async def latest(self, owner):
+        mine = [r for r in self.rows.values() if r['owner'] == owner]  # Dict order = last shown.
+        return copy.deepcopy(mine[-1]) if mine else None
 
     async def get(self, identifier, owner):
         row = self.rows.get(identifier)

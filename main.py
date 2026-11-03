@@ -78,7 +78,7 @@ async def health():
 
 def row_reply(row):
     if not row:
-        return reply('주문을 찾지 못했습니다. 본인이 작성한 주문인지 확인해 주세요.')
+        return reply('진행 중인 주문이 없습니다. 주문 내용을 보내 주세요.\n' + dialog.EXAMPLE)
     identifier = row['id']
     status = row['status']
     if status == 'submitted':
@@ -86,16 +86,17 @@ def row_reply(row):
     if status == 'draft':
         if row.get('fresh') is False:
             return reply('확인 시간이 만료되었습니다. 취소 후 주문 내용을 다시 보내 주세요.',
-                         [('주문 취소', '취소 ' + identifier)])
+                         [('주문 취소', '주문 취소')])
         mode = '[테스트 모드] 확정해도 주문앱에는 보내지 않습니다.\n' if dry_run() else ''
         return reply(mode + '아래 내용을 확인하고 주문 확정을 눌러 주세요. 아직 접수되지 않았습니다.\n' + row['preview'],
-                     [('주문 확정', '확정 ' + identifier), ('취소', '취소 ' + identifier)])
+                     [('주문 확정', '주문 확정'), ('취소', '주문 취소')])
     if status == 'cancelled':
         return reply('주문 초안이 취소되었습니다. 다시 주문 내용을 입력할 수 있습니다.')
     if status == 'rejected':
-        return reply('주문 API가 요청을 거절했습니다. 담당자에게 문의해 주세요.\n확인번호: ' + identifier)
-    return reply('접수 결과 확인이 필요합니다. 중복 접수를 막기 위해 재전송하지 않습니다. 담당자에게 확인번호를 알려 주세요.\n확인번호: ' + identifier,
-                 [('결과 확인', '조회 ' + identifier)])
+        return reply('주문 API가 요청을 거절했습니다. 담당자에게 문의해 주세요.')
+    # The confirmation ID stays out of the chat; staff match it via the order memo 카카오접수:<id> and the log.
+    return reply('접수 결과 확인이 필요합니다. 중복 접수를 막기 위해 재전송하지 않습니다. 담당자에게 실제 주문 목록 확인을 요청해 주세요.',
+                 [('결과 확인', '결과 확인')])
 
 
 class Context:
@@ -172,11 +173,13 @@ async def confirm(st, owner, action, identifier):
             if response.status_code == 401:
                 await st.clear_token()
             status = 'rejected' if 400 <= response.status_code < 500 else 'unknown'
+            logger.error('order_not_confirmed id=%s status=%s http=%s', identifier, status, response.status_code)
             await st.finish(identifier, owner, status)
             return row_reply({**claimed, 'status': status})
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            logger.error('order_not_confirmed id=%s status=unknown code=%s', identifier, error_code(exc))
             await st.finish(identifier, owner, 'unknown')
             return row_reply({**claimed, 'status': 'unknown'})
 
@@ -189,15 +192,23 @@ async def process(body):
     if text == '내 연결코드':
         return reply('담당자에게 아래 연결코드를 전달해 주세요.\n' + owner)
     st = storage()
-    cmd = re.fullmatch(r'(확정|취소|조회) ([0-9a-f]{32})', text)
+    cmd = re.fullmatch(r'(확정|취소|조회) ([0-9a-f]{32})', text)  # Buttons sent before IDs were hidden.
     if cmd:
         return await confirm(st, owner, *cmd.groups())
+    if text in ('주문 확정', '결과 확인'):
+        latest = await st.latest(owner)
+        if not latest:
+            return row_reply(None)
+        return await confirm(st, owner, '확정' if text == '주문 확정' else '조회', latest['id'])
     if text in ('주문자 변경', '내 정보 삭제'):
         await st.clear_profile(owner)
         await st.clear_session(owner)
         return reply('저장된 주문자 정보를 지웠습니다. 다음 주문 때 다시 여쭤볼게요.')
     if text in dialog.CANCEL_WORDS:
         await st.clear_session(owner)
+        latest = await st.latest(owner)
+        if latest and latest['status'] == 'draft':
+            return await confirm(st, owner, '취소', latest['id'])
         return reply('주문 입력을 취소했습니다. 새 주문 내용을 보내 주세요.\n' + dialog.EXAMPLE)
     today = dt.datetime.now(KST).date()
     s = await st.session(owner)
