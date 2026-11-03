@@ -1,5 +1,6 @@
 """Kakao skill receiver. Default: dry run, no logistics writes."""
 import asyncio
+import datetime as dt
 import hashlib
 import hmac
 import json
@@ -7,28 +8,20 @@ import logging
 import os
 import re
 import uuid
-from functools import lru_cache
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
+import dialog
 from backend import Backend, client
 from contract import build_order
-from orders import OrderError, parse_order, summary
-from storage import Store
+from orders import KST, OrderError, extract
+from storage import MemoryStore, Store
 
 app = FastAPI(title='Kakao Order Receiver', docs_url=None, redoc_url=None, openapi_url=None)
 logger = logging.getLogger('receiver')
 store = Store()
-
-
-async def partner_rows(api, http, headers, cfg):
-    source = cfg.get('partner_source', 'api')
-    if source == 'api':
-        return await api.partners(http, headers)
-    if source == 'config':
-        return cfg.get('partners', [])
-    raise ValueError('partner_source must be api or config')
+memory = MemoryStore()
 
 
 class User(BaseModel):
@@ -59,10 +52,12 @@ def dry_run():
     return value == 'true'
 
 
-@lru_cache
-def config():
-    # Runtime environment variable, never customer details committed to Git.
-    return json.loads(os.getenv('ORDER_CONFIG_JSON', '{}'))
+def storage():
+    if os.getenv('RECEIVER_DATABASE_URL'):
+        return store
+    if dry_run():
+        return memory
+    raise ValueError('Missing persistent database')
 
 
 def authorize(request):
@@ -91,7 +86,8 @@ def row_reply(row):
         if row.get('fresh') is False:
             return reply('확인 시간이 만료되었습니다. 취소 후 주문 내용을 다시 보내 주세요.',
                          [('주문 취소', '취소 ' + identifier)])
-        return reply('아래 내용을 확인하고 주문 확정을 눌러 주세요. 아직 접수되지 않았습니다.\n' + row['preview'],
+        mode = '[테스트 모드] 확정해도 주문앱에는 보내지 않습니다.\n' if dry_run() else ''
+        return reply(mode + '아래 내용을 확인하고 주문 확정을 눌러 주세요. 아직 접수되지 않았습니다.\n' + row['preview'],
                      [('주문 확정', '확정 ' + identifier), ('취소', '취소 ' + identifier)])
     if status == 'cancelled':
         return reply('주문 초안이 취소되었습니다. 다시 주문 내용을 입력할 수 있습니다.')
@@ -101,6 +97,87 @@ def row_reply(row):
                  [('결과 확인', '조회 ' + identifier)])
 
 
+class Context:
+    """Backend lookups for dialog.py. Connects and logs in at most once, and only when needed."""
+    def __init__(self, profile, today):
+        self.api, self.client, self.headers = Backend(), None, None
+        self.profile, self.today = profile, today
+
+    @property
+    def http(self):
+        if self.client is None:
+            self.client = client()
+        return self.client
+
+    async def close(self):
+        if self.client is not None:
+            await self.client.aclose()
+
+    async def auth(self):
+        if self.headers is None:
+            self.headers = await self.api.login(self.http)
+        return self.headers
+
+    async def catalog(self):
+        return await self.api.catalog(self.http, await self.auth())
+
+    async def members(self, name):
+        return await self.api.members(self.http, await self.auth(), name)
+
+    async def churches(self):
+        return await self.api.churches(self.http)
+
+    async def partners(self, q):
+        return await self.api.partners(self.http, await self.auth(), q)
+
+
+async def confirm(st, owner, action, identifier):
+    row = await st.get(identifier, owner)
+    if not row:
+        return row_reply(None)
+    if action == '취소':
+        await st.cancel(identifier, owner)
+        return row_reply(await st.get(identifier, owner))
+    if action == '조회' or row['status'] != 'draft' or not row.get('fresh', True):
+        return row_reply(row)
+    if dry_run():
+        await st.cancel(identifier, owner)
+        return reply('[테스트 모드] 주문앱에는 보내지 않았습니다.\n' + row['preview'])
+    api = Backend()
+    async with client() as http:
+        headers = await api.login(http)  # Login failure occurs before the claim.
+        claimed = await st.claim(identifier, owner)
+        if not claimed:
+            return row_reply(await st.get(identifier, owner))
+        request = claimed['payload']['request']
+        # From this point, any cancellation/error leaves status posting/unknown.
+        # Never retry a possibly committed POST without backend idempotency support.
+        try:
+            response = await api.create(http, headers, request)
+            if response.status_code in (200, 201):
+                result = response.json()
+                # Do not turn arbitrary 2xx/202 acknowledgments into order success.
+                number = result.get('orderNumber') if isinstance(result, dict) else None
+                owner_id = result.get('userId') if isinstance(result, dict) else None
+                # A new orderer gets a member id the receiver could not know in advance.
+                owner_ok = (type(owner_id) is int and owner_id > 0 if 'ordererProfile' in request
+                            else owner_id == request['userId'])
+                if (not isinstance(number, str) or not number.strip()
+                        or type(result.get('id')) is not int or result['id'] <= 0 or not owner_ok):
+                    raise ValueError('Unconfirmed order response')
+                await st.finish(identifier, owner, 'submitted', number)
+                claimed.update(status='submitted', order_no=number)
+                return row_reply(claimed)
+            status = 'rejected' if 400 <= response.status_code < 500 else 'unknown'
+            await st.finish(identifier, owner, status)
+            return row_reply({**claimed, 'status': status})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await st.finish(identifier, owner, 'unknown')
+            return row_reply({**claimed, 'status': 'unknown'})
+
+
 async def process(body):
     text = body.userRequest.utterance.strip()
     owner = body.userRequest.user.id
@@ -108,80 +185,57 @@ async def process(body):
         return reply('카카오 → Python 서버 연결 성공.\n모드: ' + ('테스트(주문 저장 안 함)' if dry_run() else '실제 주문'))
     if text == '내 연결코드':
         return reply('담당자에게 아래 연결코드를 전달해 주세요.\n' + owner)
-    if dry_run():
-        parsed = parse_order(text)
-        return reply('[테스트] 분석 결과입니다. 실제 주문은 저장하지 않았습니다.\n' + summary(parsed))
-    cfg = config()
-    binding = cfg.get('bindings', {}).get(owner)
-    if not binding:
-        return reply('조합원 계정 연결이 필요합니다. “내 연결코드”를 입력하고 담당자에게 전달해 주세요.')
-    if not os.getenv('RECEIVER_DATABASE_URL'):
-        raise ValueError('Missing persistent database')
+    st = storage()
     cmd = re.fullmatch(r'(확정|취소|조회) ([0-9a-f]{32})', text)
     if cmd:
-        action, identifier = cmd.groups()
-        row = await store.get(identifier, owner)
-        if not row:
-            return row_reply(None)
-        if action == '취소':
-            await store.cancel(identifier, owner)
-            return row_reply(await store.get(identifier, owner))
-        if action == '조회' or row['status'] != 'draft' or not row.get('fresh', True):
-            return row_reply(row)
-        # Re-check current member/destination authorization before creating an order.
-        saved = row['payload']
-        if ('request' not in saved or saved['request']['userId'] != binding.get('userId')
-                or saved.get('partnerId') not in binding.get('allowed_partner_ids', [])):
-            raise OrderError('주문 권한 설정이 변경되었습니다. 담당자에게 확인해 주세요.')
-        api = Backend()
-        async with client() as http:
-            headers = await api.login(http)  # Login failure occurs before the claim.
-            current_partners = await partner_rows(api, http, headers, cfg)
-            matches = [p for p in current_partners if p.get('id') == saved['partnerId']]
-            if (len(matches) != 1 or saved.get('partnerSnapshot') !=
-                    {k: matches[0].get(k) for k in ('name', 'contactName', 'phone', 'address')}):
-                raise OrderError('거래처 정보가 변경되었습니다. 초안을 취소하고 다시 입력해 주세요.')
-            claimed = await store.claim(identifier, owner)
-            if not claimed:
-                return row_reply(await store.get(identifier, owner))
-            # From this point, any cancellation/error leaves status posting/unknown.
-            # Never retry a possibly committed POST without backend idempotency support.
+        return await confirm(st, owner, *cmd.groups())
+    if text in ('주문자 변경', '내 정보 삭제'):
+        await st.clear_profile(owner)
+        await st.clear_session(owner)
+        return reply('저장된 주문자 정보를 지웠습니다. 다음 주문 때 다시 여쭤볼게요.')
+    if text in dialog.CANCEL_WORDS:
+        await st.clear_session(owner)
+        return reply('주문 입력을 취소했습니다. 새 주문 내용을 보내 주세요.\n' + dialog.EXAMPLE)
+    today = dt.datetime.now(KST).date()
+    s = await st.session(owner)
+    try:
+        found = extract(text, today)
+    except OrderError:
+        if s is None:
+            raise
+        found = None  # A reply to a question need not parse as an order.
+    if s and found and found['items'] and found.get('date'):
+        s = None  # A complete new order replaces the one in progress.
+    ctx = Context(await st.profile(owner), today)
+    try:
+        problem = ''
+        if s is None:
+            if not dialog.is_order_like(found):
+                return reply('주문 내용을 보내 주세요. 날짜, 상품과 수량, 받는 곳을 쉼표나 줄바꿈으로 나눠 적으면 됩니다.\n'
+                             + dialog.EXAMPLE)
+            s = dialog.new_state(found)
+        else:
             try:
-                response = await api.create(http, headers, claimed['payload']['request'])
-                if response.status_code in (200, 201):
-                    result = response.json()
-                    # Do not turn arbitrary 2xx/202 acknowledgments into order success.
-                    number = result.get('orderNumber') if isinstance(result, dict) else None
-                    if (not isinstance(number, str) or not number.strip()
-                            or type(result.get('id')) is not int or result['id'] <= 0
-                            or result.get('userId') != claimed['payload']['request']['userId']):
-                        raise ValueError('Unconfirmed order response')
-                    await store.finish(identifier, owner, 'submitted', number)
-                    claimed.update(status='submitted', order_no=number)
-                    return row_reply(claimed)
-                status = 'rejected' if 400 <= response.status_code < 500 else 'unknown'
-                await store.finish(identifier, owner, status)
-                return row_reply({**claimed, 'status': status})
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                await store.finish(identifier, owner, 'unknown')
-                return row_reply({**claimed, 'status': 'unknown'})
-
-    parsed = parse_order(text)
-    api = Backend()
-    async with client() as http:
-        headers = await api.login(http)
-        catalog, partners = await asyncio.gather(api.catalog(http, headers), partner_rows(api, http, headers, cfg))
-    payload, preview = build_order(parsed, binding, cfg, catalog, partners)
+                await dialog.answer(s, text, ctx)
+            except OrderError as exc:
+                problem = str(exc) + '\n\n'
+        question = await dialog.next_question(s, ctx)
+        if question:
+            await st.save_session(owner, s)
+            return reply(problem + question.text, question.choices)
+        await ctx.auth()
+        payload, preview = build_order(s, ctx.api.admin_id, today)
+    finally:
+        await ctx.close()
     identifier = uuid.uuid4().hex
-    request_payload = payload['request']
-    request_payload['extraNote'] = '카카오접수:' + identifier
-    canonical = {'owner': owner, 'userId': request_payload['userId'],
-                 'partnerId': payload['partnerId'], 'date': parsed['ship_date'],
-                 'items': sorted((i['productName'], i['quantity']) for i in request_payload['items'])}
+    payload['extraNote'] = '카카오접수:' + identifier
+    canonical = {'owner': owner, 'phone': s['orderer']['phone'], 'date': s['date'], 'company': s['company'],
+                 'kind': s['kind'], 'items': sorted((i['productName'], i['quantity']) for i in payload['items'])}
     fingerprint = hashlib.sha256(json.dumps(canonical, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-    row = await store.draft(owner, fingerprint, payload, preview, identifier)
+    if s.get('save_profile'):
+        await st.save_profile(owner, s['orderer']['name'], s['orderer']['phone'])
+    row = await st.draft(owner, fingerprint, {'request': payload}, preview, identifier)
+    await st.clear_session(owner)
     return row_reply(row)
 
 

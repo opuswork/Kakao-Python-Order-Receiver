@@ -1,104 +1,157 @@
-"""Adapter for the supplied Prisma models and POST /api/orders example.
+"""Matches chat answers to the SANC catalog/churches and builds the POST /api/orders body.
 
-Partners are read from the supplied API and filtered by an explicit allowlist. Order writes always go through the existing API.
+The body mirrors the admin 제품주문서 (fe OrderListInput.tsx) so admin, print and factory
+screens read Kakao orders the same way. New orderers go through ordererProfile and
+OrdersService finds-or-creates the member by phone.
 """
+import base64
 import datetime as dt
+import json
 import re
 from decimal import Decimal, InvalidOperation
 
-from orders import OrderError, summary
+from orders import KST, STORES, OrderError
 
-PRICE_FIELDS = {'wholesalePrice', 'associatePrice', 'priceOver100man',
-                'priceOver500man', 'retailPrice', 'supermarketPrice', 'schoolServePrice'}
-
-
-def positive_id(value):
-    return type(value) is int and value > 0
+UNIT = re.compile(r'[（(]\s*(박스|개|병|통|팩|봉|세트)\s*[）)]')
+DIRECTOR_TYPES = {'GWANJANG', 'CHONGMU'}
 
 
-def select_partner(parsed, binding, partners):
-    # Partner.userId records the creator; the supplied service deliberately shares search.
-    matches = [p for p in partners if positive_id(p.get('id'))
-               and p['id'] in binding.get('allowed_partner_ids', [])
-               and parsed['company'] in [p.get('name'), *p.get('aliases', [])]]
-    if len(matches) != 1:
-        raise OrderError('연결된 거래처가 없거나 이름이 중복됩니다. 담당자에게 확인해 주세요.')
-    return matches[0]
+def norm(name):
+    name = (name or '').lower().strip().lstrip('*').strip()
+    name = UNIT.sub('', name).replace('리터', 'l').replace('밀리', 'm')
+    return re.sub(r'[\s()（）]', '', name)
 
 
-def build_order(parsed, binding, config, catalog, partners=None):
-    user_id = binding.get('userId')
-    if not positive_id(user_id):
-        raise OrderError('회원 연결 설정을 확인해 주세요.')
-    partner = select_partner(parsed, binding, config.get('partners', []) if partners is None else partners)
-    if not all(isinstance(partner.get(k), str) and partner[k].strip()
-               for k in ('name', 'contactName', 'phone', 'address')):
-        raise OrderError('거래처의 담당자·연락처·배송 주소가 필요합니다.')
-    field = config.get('price_field', 'wholesalePrice')
-    if field not in PRICE_FIELDS:
-        raise OrderError('적용 단가 설정을 확인해 주세요.')
-    items, codes, total = [], set(), Decimal('0')
-    for item in parsed['items']:
-        rules = [r for r in config.get('product_map', [])
-                 if r.get('input_unit') == item['unit']
-                 and re.fullmatch(r['match'], item['name'], re.I)]
-        if len(rules) != 1:
-            raise OrderError(f"상품·규격·단위 연결을 확인해 주세요: {item['name']} ({item['unit']})")
-        rule = rules[0]
-        code = rule.get('code')
-        matches = [p for p in catalog if code and p.get('code') == code]
-        if len(matches) != 1 or code in codes:
-            raise OrderError('상품 코드가 없거나 중복되었습니다. 같은 상품은 한 줄로 입력해 주세요.')
-        product = matches[0]
-        name = product.get('productName')
-        if not name or sum(p.get('productName') == name for p in catalog) != 1:
-            raise OrderError('주문 API가 상품명으로 처리하므로 중복 상품명은 담당자 확인이 필요합니다.')
-        if product.get('openStock') is False:
-            raise OrderError('공개 주문 대상이 아닌 상품입니다.')
-        # StockInventory.unit is numeric. It does not by itself prove a box/ea conversion.
-        annotations = re.findall(r'[（(]\s*(박스|개|병|통|팩|봉|세트)\s*[）)]',
-                                 name + ' ' + str(product.get('spec') or ''))
-        known_units = set(annotations)
-        declared = rule.get('catalog_unit')
-        if declared:
-            known_units.add(declared)
-        if known_units != {item['unit']} or rule.get('quantity_multiplier', 1) != 1:
-            raise OrderError('입력 단위와 재고 상품 단위가 다르거나 불명확합니다. 박스·개 환산은 자동으로 하지 않습니다.')
-        try:
-            price = Decimal(str(product[field]))
-            if not price.is_finite() or price < 0:
-                raise ValueError()
-        except (KeyError, InvalidOperation, ValueError):
-            raise OrderError('상품 단가를 확인해 주세요.') from None
-        codes.add(code)
-        total += price * item['qty']
-        items.append({'productName': name, 'quantity': item['qty'], 'price': float(price)})
-    shipping = config.get('shipment', {})
-    time = shipping.get('estimated_time')
+def unit_of(product):
+    units = set(UNIT.findall((product.get('productName') or '') + ' ' + str(product.get('spec') or '')))
+    return units.pop() if len(units) == 1 else None
+
+
+def match_products(catalog, item):
+    """Catalog rows for a chat item. Exact name first, then names containing it.
+
+    The unit must equal the product's (박스)/(개)… annotation; there is no box↔ea conversion.
+    선물세트 needs a 인사장 and stays in the app.
+    """
+    wanted = norm(item['name'])
+    rows = [p for p in catalog if p.get('productName') and p.get('openStock') is not False
+            and p.get('category') != '선물세트' and unit_of(p) == item['unit']]
+    exact = [p for p in rows if norm(p['productName']) == wanted]
+    found = exact or ([p for p in rows if wanted in norm(p['productName'])] if len(wanted) >= 2 else [])
+    names = {}
+    for p in found:
+        names.setdefault(p['productName'].strip(), p)
+    return list(names.values())
+
+
+def price_of(product, field='wholesalePrice'):
     try:
-        window = dt.datetime.fromisoformat(parsed['ship_date'] + 'T' + time)
-        if window.utcoffset() is None:
+        price = Decimal(str(product[field]))
+        if not price.is_finite() or price < 0:
             raise ValueError()
-    except (TypeError, ValueError):
-        raise OrderError('배송 예정 시간과 시간대 설정이 필요합니다.') from None
-    shipment = {'fulfillmentType': 'PARCEL', 'deliveryAddress': partner['address'],
-                'estimatedWindow': window.isoformat()}
-    if shipping.get('carrier'):
-        shipment['carrier'] = shipping['carrier']
-    region = {'NAMBU': '남부(기장)', 'JUNGBU': '중부(덕소)', 'SEOBU': '서부(소사)'}.get(binding.get('storeRegion'))
-    if not region:
-        raise OrderError('회원의 주문 매장 지역 설정이 필요합니다.')
-    # OrdersService reads operational fields from slash-delimited notes.
-    for value in (partner['name'], partner['contactName'], partner['phone'], partner['address']):
-        if any(c in value for c in ('/', '\n', '\r')):
-            raise OrderError('거래처 정보에 주문 메모 구분 문자가 있습니다. 담당자 확인이 필요합니다.')
-    # CreateOrderDto marks these optional; OrdersService assigns SYN... server-side.
-    payload = {'userId': user_id,
-               'status': 'PLACED', 'totalAmount': float(total),
-               'notes': (f"개별택배 / 택배업체명:{partner['name']} / 택배발송일:{parsed['ship_date']}"
-                         f" / 받는분:{partner['contactName']} / 연락처:{partner['phone']}"
-                         f" / 받는분주소:{partner['address']} / 주문작업지역:{region} / 지부매장:{region}"),
-               'items': items, 'shipment': shipment}
-    preview = summary(parsed) + f"\n받는 분: {partner['contactName']}\n배송 주소: {partner['address']}\n예상 상품금액: {total:,.0f}원"
-    snapshot = {k: partner[k] for k in ('name', 'contactName', 'phone', 'address')}
-    return {'request': payload, 'partnerId': partner['id'], 'partnerSnapshot': snapshot}, preview
+        return price
+    except (KeyError, InvalidOperation, ValueError, TypeError):
+        raise OrderError(f"상품 단가가 등록되지 않았습니다: {product.get('productName')}") from None
+
+
+def search_churches(churches, query):
+    """Same rules as the order form's 중앙 search: digits → branchCode, else substring."""
+    q = (query or '').strip()
+    if not q:
+        return []
+    exact = [c for c in churches if c.get('name') == q]
+    if exact:
+        return exact
+    if q.isdigit():
+        return [c for c in churches if str(c.get('branchCode') or '') == q][:30]
+    q = q.lower()
+    return [c for c in churches
+            if q in ' '.join(str(c.get(k) or '') for k in ('name', 'region', 'branchCode', 'assigner')).lower()][:30]
+
+
+def money(value):
+    return f'{value:,.0f}원'
+
+
+def display_orderer(orderer):
+    name = orderer['name'].strip()
+    if orderer.get('memberType') in DIRECTOR_TYPES:
+        return name if name.endswith('관') else name + '관'
+    return name[:-1] if name.endswith('관') else name
+
+
+def window(date, kind, time):
+    if kind == 'parcel':
+        return f'{date}T09:00:00.000Z'
+    hour, minute = map(int, time['time'].split(':'))
+    if time['ampm'] == '오전':
+        hour = 0 if hour == 12 else hour
+    elif hour != 12:
+        hour += 12
+    # The order form stores the wall-clock time with a Z suffix; keep the same convention.
+    return f'{date}T{hour:02d}:{minute:02d}:00.000Z'
+
+
+def line_shipments(s, sender):
+    r = s['recipient']
+    delivery = s['kind'] == 'delivery'
+    ship = {'kind': s['kind'], 'companyName': s['company'],
+            'deliveryDate': s['date'] if delivery else '', 'deliveryAmPm': s['time']['ampm'] if delivery else '',
+            'deliveryTime': s['time']['time'] if delivery else '',
+            'recipientName': r['name'], 'recipientPhone': r['phone'], 'recipientAddress': r['address'],
+            'recipientAddressDetail': '', 'parcelShipDate': '' if delivery else s['date'],
+            'senderName': '' if delivery else sender['name'], 'senderPhone': '' if delivery else sender['phone'],
+            'senderAddress': '' if delivery else sender['address'], 'senderAddressDetail': '',
+            'sameAsSenderAddress': False, 'contactMode': 'address'}
+    lines = [{'product': i['productName'], 'qty': i['quantity'], 'baseQty': i['quantity'], 'note': '',
+              'unitPrice': i['price'], 'lineSection': 'box', 'deliveryOnly': False, 'ship': ship}
+             for i in s['items']]
+    raw = json.dumps({'v': 1, 'lines': lines}, ensure_ascii=False, separators=(',', ':')).encode()
+    return '배송상세:' + base64.urlsafe_b64encode(raw).decode().rstrip('=')
+
+
+def build_order(s, admin_id, today=None):
+    """Return (request body, preview text) from a completed dialog state."""
+    today = today or dt.datetime.now(KST).date()
+    o, r = s['orderer'], s['recipient']
+    branch = STORES[s['store']]
+    delivery = s['kind'] == 'delivery'
+    kind_label = '배달' if delivery else '택배'
+    # 택배 기표지의 보내는 분 = 주문자. Members have no address here, so the recipient's is used.
+    sender = {'name': display_orderer(o), 'phone': o['phone'], 'address': r['address']}
+    total = sum(Decimal(str(i['price'])) * i['quantity'] for i in s['items'])
+    notes = [f"주문자:{display_orderer(o)}", f"연락처:{o['phone']}", f'주문일자:{today.isoformat()}',
+             f"중앙:{o['churchName']}"]
+    if delivery:
+        notes += [f"배달업체명:{s['company']}", f"배달일:{s['date']} {s['time']['ampm']} {s['time']['time']}",
+                  f"받는분:{r['name']} / {r['phone']} / {r['address'] or '-'}"]
+    else:
+        notes += [f"택배업체명:{s['company']}", f"택배발송일:{s['date']}",
+                  f"보내는사람:{sender['name']} / {sender['phone']} / {sender['address']}"]
+        if r['name']:
+            notes.append(f"받는분성함:{r['name']}")
+    notes += ['수취연락:주소', f"받는분주소:{r['address']}", f'주문작업지역:{branch}', f'지부매장:{branch}',
+              '인사장종류:없음']
+    notes += [f"[{kind_label}] {i['productName']} {i['quantity']}개" for i in s['items']]
+    notes.append(line_shipments(s, sender))
+    body = {'userId': o['userId'] if o.get('userId') else admin_id, 'status': 'PLACED',
+            'totalAmount': float(total), 'notes': ' / '.join(notes), 'extraNote': '',
+            'items': [{'productName': i['productName'], 'quantity': i['quantity'], 'price': i['price']}
+                      for i in s['items']],
+            'shipment': {'fulfillmentType': 'PARCEL', 'carrier': s['company'],
+                         'deliveryAddress': r['address'] if delivery else sender['address'],
+                         'estimatedWindow': window(s['date'], s['kind'], s.get('time'))}}
+    if not o.get('userId'):
+        # OrdersService reuses the member with this phone, or registers a new one.
+        body['ordererProfile'] = {'fullname': o['name'], 'phone': o['phone'], 'churchId': o['churchId']}
+    member = ('기존 회원' if o.get('userId')
+              else '신규 회원으로 등록됩니다. 같은 번호의 회원이 있으면 그 회원으로 접수됩니다.')
+    when = f"{s['date']} {s['time']['ampm']} {s['time']['time']}" if delivery else f"발송일 {s['date']}"
+    preview = '\n'.join(
+        ['── 주문 확인 ──', f'매장: {branch}', f"주문자: {o['name']} {o['phone']}", f'  → {member}',
+         f"중앙: {o['churchName']}", f"업체: {s['company']}", f'배송: {kind_label}, {when}',
+         f"받는분: {r['name']} {r['phone']}", f"주소: {r['address']}"] +
+        [f"{i['productName']} × {i['quantity']} = {money(Decimal(str(i['price'])) * i['quantity'])}"
+         for i in s['items']] +
+        [f'상품 합계: {money(total)}'])
+    return body, preview
