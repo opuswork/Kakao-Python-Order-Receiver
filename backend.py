@@ -6,6 +6,10 @@ import json
 import httpx
 
 
+class ConfigError(RuntimeError):
+    """Missing deployment setting. The message is safe to show to users (no values)."""
+
+
 class Backend:
     def __init__(self):
         self.base = os.getenv('SANC_API_BASE_URL', 'https://be-aosm.onrender.com').rstrip('/')
@@ -25,10 +29,12 @@ class Backend:
                     raise ValueError()
                 self.admin_id = int(claims['sub'])
             except Exception:
-                raise ValueError('An admin JWT is required for delegated orders') from None
+                raise ConfigError('SANC_API_TOKEN이 관리자 토큰이 아님') from None
             return {'Authorization': 'Bearer ' + token}
-        r = await client.post(self.base + '/api/auth/login', json={
-            'username': os.environ['SANC_LOGIN_ID'], 'password': os.environ['SANC_LOGIN_PW']})
+        login_id, password = os.getenv('SANC_LOGIN_ID', ''), os.getenv('SANC_LOGIN_PW', '')
+        if not (login_id and password):
+            raise ConfigError('SANC_API_TOKEN 없음')
+        r = await client.post(self.base + '/api/auth/login', json={'username': login_id, 'password': password})
         r.raise_for_status()
         data = r.json()
         # Ordering for members requires an admin automation account, matching the original script.
