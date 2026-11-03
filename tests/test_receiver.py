@@ -219,7 +219,7 @@ def test_asks_only_missing_fields_then_previews(api):
     assert choices == ['택배', '배달']
     text, choices = say('택배')
     assert '[테스트 모드]' in text and '신규 회원' in text and '150,000원' in text
-    assert choices[0].startswith('확정 ')
+    assert choices == ['주문 확정', '주문 취소']
     text, _ = say(choices[0])
     assert '주문앱에는 보내지 않았습니다' in text and api.create.await_count == 0
 
@@ -261,7 +261,7 @@ def test_unknown_partner_asks_for_recipient(api):
     text, choices = say('배달')
     assert '배달 시간' in text
     text, choices = say('오전 10시')
-    assert '김철수' in text and choices[0].startswith('확정 ')
+    assert '김철수' in text and choices[0] == '주문 확정'
 
 
 def test_cancel_words_clear_session(api):
@@ -335,7 +335,7 @@ def test_other_user_cannot_confirm(live):
     state, api = live
     _, choices = complete_new_orderer()
     text, _ = say(choices[0], owner='u2')
-    assert '찾지 못했습니다' in text and api.create.await_count == 0
+    assert '진행 중인 주문이 없습니다' in text and api.create.await_count == 0
 
 
 def test_timeout_never_reposts(live):
@@ -344,15 +344,16 @@ def test_timeout_never_reposts(live):
     _, choices = complete_new_orderer()
     text, _ = say(choices[0])
     assert '확인이 필요' in text
-    say(choices[0])
-    identifier = choices[0].split()[1]
-    assert api.create.await_count == 1 and state.rows[identifier]['status'] == 'unknown'
+    text, choices = say(choices[0])
+    assert choices == ['결과 확인'] and '확인이 필요' in text
+    text, _ = say('결과 확인')
+    assert api.create.await_count == 1 and list(state.rows.values())[-1]['status'] == 'unknown'
 
 
 def test_expired_draft(live):
     state, api = live
     _, choices = complete_new_orderer()
-    state.rows[choices[0].split()[1]]['fresh'] = False
+    list(state.rows.values())[-1]['fresh'] = False
     text, _ = say(choices[0])
     assert '만료' in text and api.create.await_count == 0
 
@@ -360,9 +361,38 @@ def test_expired_draft(live):
 def test_cancelled_draft(live):
     state, api = live
     _, choices = complete_new_orderer()
-    say(choices[1])
+    text, _ = say(choices[1])
+    assert '취소되었습니다' in text
     say(choices[0])
     assert api.create.await_count == 0
+
+
+def test_chat_never_shows_confirmation_id(live):
+    state, api = live
+    api.create.side_effect = httpx.ReadTimeout('simulated')
+    text, choices = complete_new_orderer()
+    identifier = list(state.rows)[-1]
+    for message in [(text, choices), say(choices[0]), say('결과 확인')]:
+        assert identifier not in message[0] and not any(identifier in c for c in message[1])
+
+
+def test_buttons_confirm_the_draft_shown_last(live):
+    state, api = live
+    first = '2099-11-10, 진간장 360ml 2박스, 청운초등학교, 남부, 택배, 주문자: 이용식 010-2778-1400'
+    second = '2099-11-11, 진간장 360ml 3박스, 청운초등학교, 남부, 택배, 주문자: 이용식 010-2778-1400'
+    for order in (first, second, first):  # The first draft is reshown last.
+        say(order)
+        say('맞아요')
+    say('주문 확정')
+    assert api.create.await_count == 1
+    assert api.create.await_args.args[2]['items'][0]['quantity'] == 2
+
+
+def test_old_id_buttons_still_work(live):
+    state, api = live
+    complete_new_orderer()
+    say('확정 ' + list(state.rows)[-1])
+    assert api.create.await_count == 1
 
 
 def test_concurrent_confirm_claims_once(live):
