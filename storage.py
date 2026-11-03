@@ -84,6 +84,21 @@ class Store:
         async with await self.connect() as conn:
             await conn.execute('DELETE FROM kakao_receiver_profiles WHERE owner=%s', (owner,))
 
+    async def token(self):
+        async with await self.connect() as conn:
+            cur = await conn.execute('SELECT token FROM kakao_receiver_auth WHERE id=1')
+            row = await cur.fetchone()
+            return row['token'] if row else None
+
+    async def save_token(self, token):
+        async with await self.connect() as conn:
+            await conn.execute('''INSERT INTO kakao_receiver_auth (id, token) VALUES (1,%s)
+                ON CONFLICT (id) DO UPDATE SET token=EXCLUDED.token, updated_at=now()''', (token,))
+
+    async def clear_token(self):
+        async with await self.connect() as conn:
+            await conn.execute('DELETE FROM kakao_receiver_auth')
+
 
 class MemoryStore:
     """Same interface in process memory: tests and DRY_RUN without a database only.
@@ -92,6 +107,7 @@ class MemoryStore:
     """
     def __init__(self):
         self.rows, self.sessions, self.profiles = {}, {}, {}
+        self.cached_token = None
 
     async def draft(self, owner, fingerprint, payload, preview, identifier):
         old = next((r for r in self.rows.values() if r['fingerprint'] == fingerprint), None)
@@ -142,3 +158,12 @@ class MemoryStore:
 
     async def clear_profile(self, owner):
         self.profiles.pop(owner, None)
+
+    async def token(self):
+        return self.cached_token
+
+    async def save_token(self, token):
+        self.cached_token = token
+
+    async def clear_token(self):
+        self.cached_token = None

@@ -68,8 +68,12 @@ FastAPI / Python 3.12. 카카오톡 채널 챗봇 스킬로 들어온 간장 주
 
 1. 수신 DB에서 `schema.sql`을 실행합니다(세션·기본 주문자 테이블이 추가됨). 자동 마이그레이션은 없습니다.
 2. Vercel 환경변수: `KAKAO_SKILL_SECRET`, `SANC_API_BASE_URL=https://be-aosm.onrender.com`,
-   `SANC_API_TOKEN`(관리자 JWT), `RECEIVER_DATABASE_URL`, `DRY_RUN`.
-   - `DRY_RUN=true`여도 상품·회원·중앙·거래처 조회에는 관리자 토큰이 필요합니다.
+   `SANC_LOGIN_ID`/`SANC_LOGIN_PW`(관리자 자동화 계정), `RECEIVER_DATABASE_URL`, `DRY_RUN`.
+   - `DRY_RUN=true`여도 상품·회원·중앙·거래처 조회에는 관리자 로그인이 필요합니다.
+   - 로그인으로 받은 JWT는 `kakao_receiver_auth`에 저장해 재사용합니다. 만료 6시간 전부터
+     `POST /api/auth/refresh`로 연장하고, 만료되거나 백엔드가 401을 주면 다시 로그인합니다.
+     백엔드는 로그인할 때마다 관리자 라이브 채팅에 알림을 띄우므로 매 메시지 로그인을 피합니다.
+   - `SANC_API_TOKEN`(관리자 JWT)을 넣으면 로그인 대신 그 토큰을 씁니다. 24시간 뒤 만료되므로 임시 확인용입니다.
    - `DRY_RUN=true`이고 DB 주소가 없으면 메모리에 대화를 저장합니다. 서버리스 인스턴스가 바뀌면 대화가 끊길 수 있어 테스트용입니다.
    - `DRY_RUN=false`에는 DB가 필수입니다.
 3. 카카오 스킬 URL `https://<배포주소>/kakao/order`, 헤더 `X-Kakao-Skill-Key`=`KAKAO_SKILL_SECRET`.

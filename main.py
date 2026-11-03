@@ -100,9 +100,9 @@ def row_reply(row):
 
 class Context:
     """Backend lookups for dialog.py. Connects and logs in at most once, and only when needed."""
-    def __init__(self, profile, today):
+    def __init__(self, profile, today, cache):
         self.api, self.client, self.headers = Backend(), None, None
-        self.profile, self.today = profile, today
+        self.profile, self.today, self.cache = profile, today, cache
 
     @property
     def http(self):
@@ -116,7 +116,7 @@ class Context:
 
     async def auth(self):
         if self.headers is None:
-            self.headers = await self.api.login(self.http)
+            self.headers = await self.api.login(self.http, self.cache)
         return self.headers
 
     async def catalog(self):
@@ -146,7 +146,7 @@ async def confirm(st, owner, action, identifier):
         return reply('[테스트 모드] 주문앱에는 보내지 않았습니다.\n' + row['preview'])
     api = Backend()
     async with client() as http:
-        headers = await api.login(http)  # Login failure occurs before the claim.
+        headers = await api.login(http, st)  # Login failure occurs before the claim.
         claimed = await st.claim(identifier, owner)
         if not claimed:
             return row_reply(await st.get(identifier, owner))
@@ -169,6 +169,8 @@ async def confirm(st, owner, action, identifier):
                 await st.finish(identifier, owner, 'submitted', number)
                 claimed.update(status='submitted', order_no=number)
                 return row_reply(claimed)
+            if response.status_code == 401:
+                await st.clear_token()
             status = 'rejected' if 400 <= response.status_code < 500 else 'unknown'
             await st.finish(identifier, owner, status)
             return row_reply({**claimed, 'status': status})
@@ -207,7 +209,7 @@ async def process(body):
         found = None  # A reply to a question need not parse as an order.
     if s and found and found['items'] and found.get('date'):
         s = None  # A complete new order replaces the one in progress.
-    ctx = Context(await st.profile(owner), today)
+    ctx = Context(await st.profile(owner), today, st)
     try:
         problem = ''
         if s is None:
@@ -268,8 +270,18 @@ async def receive(request: Request):
         # Do not log access tokens, customer addresses, request bodies or database URLs.
         code = error_code(exc)
         logger.error('receiver_failure code=%s', code)
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 401:
+            await forget_token()
         return reply('처리 중 오류가 발생했습니다. 접수 완료로 처리하지 않았습니다. 확정 중이었다면 담당자에게 실제 주문 목록 확인을 요청해 주세요.'
                      f'\n(오류 코드: {code})')
+
+
+async def forget_token():
+    """A rejected cached token (e.g. rotated JWT secret) must not be reused; the next message logs in."""
+    try:
+        await storage().clear_token()
+    except Exception:
+        logger.error('receiver_failure code=token_clear')
 
 
 def error_code(exc):

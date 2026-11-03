@@ -28,3 +28,10 @@ CREATE TABLE IF NOT EXISTS kakao_receiver_profiles (
     phone text NOT NULL,
     updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Cached admin JWT from SANC_LOGIN_ID/PW, so the receiver logs in (and the backend announces it) rarely.
+CREATE TABLE IF NOT EXISTS kakao_receiver_auth (
+    id smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    token text NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
