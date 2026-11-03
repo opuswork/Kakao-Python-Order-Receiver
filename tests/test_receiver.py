@@ -387,8 +387,15 @@ def test_nonadmin_token_rejected_before_any_order(monkeypatch):
     from backend import Backend
     claims = base64.urlsafe_b64encode(json.dumps({'sub': 5, 'role': 'member'}).encode()).decode().rstrip('=')
     monkeypatch.setenv('SANC_API_TOKEN', f'h.{claims}.s')
-    with pytest.raises(ValueError):
+    with pytest.raises(RuntimeError, match='관리자 토큰이 아님'):
         asyncio.run(Backend().login(None))
+
+
+def test_missing_token_is_a_clear_setting_error(monkeypatch):
+    for name in ('SANC_API_TOKEN', 'SANC_LOGIN_ID', 'SANC_LOGIN_PW'):
+        monkeypatch.delenv(name, raising=False)
+    text, _ = say(ORDER)
+    assert '오류 코드: 설정 오류: SANC_API_TOKEN 없음' in text
 
 
 def test_admin_token_gives_admin_id(monkeypatch):

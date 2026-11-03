@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 import dialog
-from backend import Backend, client
+from backend import Backend, ConfigError, client
 from contract import build_order
 from orders import KST, OrderError, extract
 from storage import MemoryStore, Store
@@ -274,6 +274,8 @@ async def receive(request: Request):
 
 def error_code(exc):
     """Short, secret-free cause shown to the user so failures can be diagnosed without server logs."""
+    if isinstance(exc, ConfigError):
+        return f'설정 오류: {exc}'
     if isinstance(exc, httpx.HTTPStatusError):
         return f'{type(exc).__name__} {exc.response.status_code} {exc.request.url.path}'
     if isinstance(exc, httpx.RequestError):
