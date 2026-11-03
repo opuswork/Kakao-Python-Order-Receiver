@@ -8,9 +8,10 @@ import httpx
 
 class Backend:
     def __init__(self):
-        self.base = os.getenv('SANC_API_BASE_URL', 'https://sanc-logistics-fe.vercel.app').rstrip('/')
+        self.base = os.getenv('SANC_API_BASE_URL', 'https://be-aosm.onrender.com').rstrip('/')
         if not self.base.startswith('https://'):
             raise ValueError('SANC_API_BASE_URL must use HTTPS')
+        self.admin_id = None
 
     async def login(self, client):
         token = os.getenv('SANC_API_TOKEN', '').strip()
@@ -22,6 +23,7 @@ class Backend:
                 claims = json.loads(base64.urlsafe_b64decode(segment + '=' * (-len(segment) % 4)))
                 if str(claims.get('role', '')).lower() != 'admin':
                     raise ValueError()
+                self.admin_id = int(claims['sub'])
             except Exception:
                 raise ValueError('An admin JWT is required for delegated orders') from None
             return {'Authorization': 'Bearer ' + token}
@@ -29,9 +31,10 @@ class Backend:
             'username': os.environ['SANC_LOGIN_ID'], 'password': os.environ['SANC_LOGIN_PW']})
         r.raise_for_status()
         data = r.json()
-        # Multi-member ordering requires an admin automation account, matching the original script.
+        # Ordering for members requires an admin automation account, matching the original script.
         if str(data.get('user', {}).get('role', '')).lower() != 'admin':
             raise ValueError('Use an authorized admin automation account')
+        self.admin_id = int(data['user']['id'])
         return {'Authorization': 'Bearer ' + data['accessToken']}
 
     async def catalog(self, client, headers):
@@ -47,18 +50,28 @@ class Backend:
                 raise ValueError('Invalid catalog price')
         return rows
 
-    async def create(self, client, headers, payload):
-        return await client.post(self.base + '/api/orders', headers=headers, json=payload)
+    async def members(self, client, headers, name):
+        # Admin autocomplete: fullname contains q, at most 10 rows.
+        r = await client.get(self.base + '/api/members/search', headers=headers, params={'q': name})
+        r.raise_for_status()
+        return r.json()
 
-    async def partners(self, client, headers):
-        # No q: the supplied endpoint limits shared name searches to 30 hits.
-        # An authorized admin token returns the full list. Never write Partner data here.
-        r = await client.get(self.base + '/api/partners', headers=headers)
+    async def churches(self, client):
+        r = await client.get(self.base + '/api/churches')
+        r.raise_for_status()
+        return r.json()
+
+    async def partners(self, client, headers, q):
+        # Name contains q, at most 30 rows. Read only; never write Partner data here.
+        r = await client.get(self.base + '/api/partners', headers=headers, params={'q': q})
         r.raise_for_status()
         rows = r.json()
         if not isinstance(rows, list):
             raise ValueError('Expected Partner array')
         return rows
+
+    async def create(self, client, headers, payload):
+        return await client.post(self.base + '/api/orders', headers=headers, json=payload)
 
 
 def client():

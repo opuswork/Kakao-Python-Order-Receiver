@@ -1,5 +1,5 @@
 import asyncio
-import copy
+import base64
 import datetime as dt
 import json
 from unittest.mock import AsyncMock
@@ -9,343 +9,381 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
-from orders import OrderError, parse_order
-from contract import build_order
+from contract import match_products, search_churches
+from orders import OrderError, extract, parse_time
+from storage import MemoryStore
 
 SECRET = 'test-only-secret-' * 4
 CLIENT = TestClient(main.app)
 HEADERS = {'X-Kakao-Skill-Key': SECRET}
+ORDER = '2099-11-10, 1급진간장 1.8L 10박스, 청운초등학교'
+
+CATALOG = [
+    {'code': 'A', 'productName': '* 1급진간장 1.8L(박스)', 'wholesalePrice': 15000, 'category': '일반품'},
+    {'code': 'B', 'productName': '* 1급진간장 1.8L(개)', 'wholesalePrice': 2500, 'category': '일반품'},
+    {'code': 'C', 'productName': '* 진간장 360mL(박스)', 'wholesalePrice': 12000, 'category': '일반품'},
+    {'code': 'D', 'productName': '* 양조진간장 360mL(박스)', 'wholesalePrice': 13000, 'category': '일반품'},
+    {'code': 'E', 'productName': '명절 선물세트 1호(박스)', 'wholesalePrice': 30000, 'category': '선물세트'},
+]
+CHURCHES = [{'id': 3, 'name': '서대문남', 'region': '서울', 'branchCode': '7'},
+            {'id': 4, 'name': '서대문북', 'region': '서울', 'branchCode': '8'},
+            {'id': 5, 'name': '원주', 'region': '강원', 'branchCode': '5'}]
+MEMBER = {'id': 55, 'fullname': '이용식', 'phone': '010-2778-1400', 'memberType': 'GWANJANG',
+          'churchId': 3, 'churchName': '서대문남'}
+PARTNER = {'id': 7, 'name': '청운초등학교', 'contactName': '함은숙', 'phone': '010-1111-2222',
+           'address': '서울 종로구 자하문로 1'}
 
 
 @pytest.fixture(autouse=True)
 def environment(monkeypatch):
     monkeypatch.setenv('KAKAO_SKILL_SECRET', SECRET)
     monkeypatch.setenv('DRY_RUN', 'true')
-    main.config.cache_clear()
+    monkeypatch.delenv('RECEIVER_DATABASE_URL', raising=False)
+    monkeypatch.setattr(main, 'memory', MemoryStore())
 
 
-def data(text='신선유통, 2099-10-21, 1급진간장 1.8리터 300박스', owner='u1'):
-    return {'userRequest': {'utterance': text, 'user': {'id': owner}}}
+@pytest.fixture
+def api(monkeypatch):
+    backend = AsyncMock()
+    backend.admin_id = 1
+    backend.login.return_value = {'Authorization': 'Bearer fake'}
+    backend.catalog.return_value = CATALOG
+    backend.churches.return_value = CHURCHES
+    backend.members.side_effect = lambda http, headers, name: [MEMBER] if name in MEMBER['fullname'] else []
+    backend.partners.side_effect = lambda http, headers, q: [PARTNER] if q in PARTNER['name'] else []
+    backend.create.return_value = httpx.Response(201, json={'id': 9, 'userId': 55, 'orderNumber': 'SYN0123456789'})
+    monkeypatch.setattr(main, 'Backend', lambda: backend)
+    monkeypatch.setattr(main, 'client', AsyncMock)  # No TLS setup per message in tests.
+    return backend
 
 
-def message(response):
-    return response.json()['template']['outputs'][0]['simpleText']['text']
+@pytest.fixture
+def live(monkeypatch, api):
+    monkeypatch.setenv('DRY_RUN', 'false')
+    monkeypatch.setenv('RECEIVER_DATABASE_URL', 'unused-mocked-database')
+    state = MemoryStore()
+    monkeypatch.setattr(main, 'store', state)
+    return state, api
 
 
-def test_dry_run_no_backend_or_db(monkeypatch):
-    def forbidden(*args):
-        raise AssertionError('dry run must not contact backend')
-    monkeypatch.setattr(main, 'Backend', forbidden)
-    r = CLIENT.post('/kakao/order', headers=HEADERS, json=data())
-    assert r.status_code == 200 and '300박스' in message(r) and '저장하지 않았습니다' in message(r)
+def say(text, owner='u1'):
+    r = CLIENT.post('/kakao/order', headers=HEADERS, json={'userRequest': {'utterance': text, 'user': {'id': owner}}})
+    assert r.status_code == 200, r.text
+    template = r.json()['template']
+    return template['outputs'][0]['simpleText']['text'], [q['messageText'] for q in template.get('quickReplies', [])]
 
+
+def complete_new_orderer(owner='u1'):
+    say(ORDER, owner)
+    say('중부', owner)
+    say('홍길동 010-1234-5678', owner)
+    text, choices = say('서대문', owner)
+    assert choices == ['서대문남', '서대문북']
+    say('서대문남', owner)
+    say('맞아요', owner)
+    return say('택배', owner)
+
+
+# ---------------------------------------------------------------- receiver basics
 
 def test_auth_and_malformed():
-    assert CLIENT.post('/kakao/order', json=data()).status_code == 401
+    body = {'userRequest': {'utterance': '연결확인', 'user': {'id': 'u1'}}}
+    assert CLIENT.post('/kakao/order', json=body).status_code == 401
     assert CLIENT.post('/kakao/order', headers=HEADERS, json={}).status_code == 400
     assert CLIENT.post('/kakao/order', headers=HEADERS, content='a'*33000).status_code == 413
 
 
 def test_missing_secret(monkeypatch):
     monkeypatch.delenv('KAKAO_SKILL_SECRET')
-    assert CLIENT.post('/kakao/order', headers=HEADERS, json=data()).status_code == 503
+    body = {'userRequest': {'utterance': '연결확인', 'user': {'id': 'u1'}}}
+    assert CLIENT.post('/kakao/order', headers=HEADERS, json=body).status_code == 503
+
+
+def test_live_mode_requires_database(monkeypatch, api):
+    monkeypatch.setenv('DRY_RUN', 'false')
+    text, _ = say(ORDER)
+    assert '오류' in text and api.create.await_count == 0
+
+
+def test_greeting_does_not_start_an_order(api):
+    text, _ = say('안녕하세요')
+    assert '주문 내용을 보내 주세요' in text and api.catalog.await_count == 0
+
+
+# ---------------------------------------------------------------- extraction
+
+def test_extract_labelled_chat_order():
+    found = extract('27일납품\n진간장 360ml 2박스\n청운초등학교\n\n주문자 성명: 이용식,\n전화번호: 01027781400\n'
+                    '배달시간: 05:00\n주문매장: 중부\n상세주소: 서소문로 55-6 으로 검색, 상세주소:1층',
+                    dt.date(2026, 10, 14))
+    assert found['date'] == '2026-10-27' and found['store'] == 'JUNGBU'
+    assert found['items'] == [{'name': '진간장 360ml', 'qty': 2, 'unit': '박스'}]
+    assert (found['orderer_name'], found['orderer_phone']) == ('이용식', '010-2778-1400')
+    assert found['time'] == {'ampm': '오전', 'time': '05:00'}
+    assert found['unknown'] == ['청운초등학교'] and found['address'] == '서소문로 55-6 으로 검색 1층'
+
+
+@pytest.mark.parametrize('text', [
+    '11월 10일, 1급진간장 1.8리터 10개, 신선유통 주문합니다.(테스트)',
+    '1급진간장 1.8리터 10개 / 신선유통 / 11/10 납품',
+    '신선유통, 11월 10일까지, 1급진간장 1.8리터 10개 주문 부탁드립니다!',
+])
+def test_any_part_order_and_courtesy_endings(text):
+    found = extract(text, dt.date(2026, 10, 27))
+    assert found['date'] == '2026-11-10' and found['unknown'] == ['신선유통']
+    assert found['items'] == [{'name': '1급진간장 1.8리터', 'qty': 10, 'unit': '개'}]
+
+
+def test_day_only_date_rolls_to_next_month():
+    assert extract('3일 납품, 진간장 1박스', dt.date(2026, 10, 28))['date'] == '2026-11-03'
+    assert extract('3일 납품, 진간장 1박스', dt.date(2026, 12, 28))['date'] == '2027-01-03'
 
 
 @pytest.mark.parametrize('text', [
     '신선유통, 2099-02-30, 진간장 3박스',
     '신선유통, 2099-10-21, 진간장 0박스',
-    '신선유통, 2099-10-21, 진간장 세박스',
-    '신선유통, 2099-10-21, 진간장 3박스 취소',
     '신선유통, 2099-10-21, 진간장 3박스, 진간장 3박스',
-    '신선유통, 내일, 진간장 3박스',
+    '2099-11-10, 2099-11-11, 진간장 3박스',
+    '2099-11-10, 진간장 3박스, 남부, 서부',
+    '신선유통, 9월 21일, 진간장 3박스',
 ])
-def test_ambiguous_inputs_not_submitted(text):
+def test_invalid_or_ambiguous_inputs_rejected(text):
     with pytest.raises(OrderError):
-        parse_order(text)
+        extract(text, dt.date(2026, 10, 14))
 
 
-def test_year_and_multiple_items():
-    p = parse_order('신선유통, 10월 21일, 진간장 300박스\n국간장 3통', dt.date(2026, 10, 14))
-    assert p['ship_date'] == '2026-10-21' and len(p['items']) == 2
-    with pytest.raises(OrderError):
-        parse_order('신선유통, 9월 21일, 진간장 3박스', dt.date(2026, 10, 14))
-
-
-@pytest.mark.parametrize('text', [
-    '11월 10일, 1급진간장 1.8리터 10개, 신선유통 주문합니다.(테스트)',
-    '1급진간장 1.8리터 10개, 신선유통, 11/10 납품',
-    '신선유통, 11월 10일까지, 1급진간장 1.8리터 10개 주문 부탁드립니다!',
+@pytest.mark.parametrize('text, expected', [
+    ('오전 10시', ('오전', '10:00')), ('오후 2시 반', ('오후', '02:30')), ('14:30', ('오후', '02:30')),
+    ('12시', ('오후', '12:00')), ('새벽 5시', ('오전', '05:00')),
 ])
-def test_any_part_order_and_courtesy_endings(text):
-    p = parse_order(text, dt.date(2026, 10, 27))
-    assert p == {'company': '신선유통', 'ship_date': '2026-11-10',
-                 'items': [{'name': '1급진간장 1.8리터', 'qty': 10, 'unit': '개'}]}
+def test_delivery_time(text, expected):
+    t = parse_time(text)
+    assert (t['ampm'], t['time']) == expected
 
 
-@pytest.mark.parametrize('text', [
-    '신선유통, 11월 10일, 11월 11일, 진간장 3박스',
-    '신선유통, 한빛상회, 11월 10일, 진간장 3박스',
-    '신선유통, 11월 10일 주문합니다',
-])
-def test_reordered_inputs_still_reject_ambiguity(text):
-    with pytest.raises(OrderError):
-        parse_order(text, dt.date(2026, 10, 27))
+def test_product_matching_rules():
+    assert [p['code'] for p in match_products(CATALOG, {'name': '1급진간장 1.8리터', 'unit': '박스'})] == ['A']
+    assert [p['code'] for p in match_products(CATALOG, {'name': '1급진간장 1.8L', 'unit': '개'})] == ['B']
+    assert [p['code'] for p in match_products(CATALOG, {'name': '진간장 360ml', 'unit': '박스'})] == ['C']
+    assert {p['code'] for p in match_products(CATALOG, {'name': '간장 360ml', 'unit': '박스'})} == {'C', 'D'}
+    assert match_products(CATALOG, {'name': '1급진간장 1.8L', 'unit': '병'}) == []
+    assert match_products(CATALOG, {'name': '명절 선물세트 1호', 'unit': '박스'}) == []
 
 
-def configuration():
-    return {'partner_source': 'config', 'bindings': {'u1': {'userId': 123, 'allowed_partner_ids': [7], 'storeRegion': 'NAMBU'}},
-            'partners': [{'id': 7, 'userId': 123, 'name': '신선유통', 'contactName': '테스트',
-                          'phone': '01000000000', 'address': '테스트 주소'}],
-            'shipment': {'estimated_time': '09:00:00+09:00'},
-            'product_map': [{'match': r'1급진간장\s*1[.]8리터', 'input_unit': '박스',
-                             'code': 'TEST-BOX', 'catalog_unit': '박스'}]}
+def test_church_search_matches_order_form():
+    assert [c['name'] for c in search_churches(CHURCHES, '5')] == ['원주']
+    assert [c['name'] for c in search_churches(CHURCHES, '서울')] == ['서대문남', '서대문북']
+    assert [c['name'] for c in search_churches(CHURCHES, '서대문남')] == ['서대문남']
 
 
-def catalog():
-    return [{'code': 'TEST-BOX', 'productName': 'TEST 1.8L(박스)',
-             'spec': '1.8L(박스)', 'wholesalePrice': 100, 'openStock': True}]
+# ---------------------------------------------------------------- dialog
+
+def test_asks_only_missing_fields_then_previews(api):
+    text, choices = say(ORDER)
+    assert '매장' in text and choices == ['남부', '중부', '서부']
+    text, _ = say('중부')
+    assert '주문자 성함과 전화번호' in text
+    text, _ = say('홍길동 010-1234-5678')
+    assert '중앙을 검색' in text
+    say('서대문')
+    text, choices = say('서대문남')
+    assert '함은숙' in text and choices == ['맞아요', '직접 입력']
+    text, choices = say('맞아요')
+    assert choices == ['택배', '배달']
+    text, choices = say('택배')
+    assert '[테스트 모드]' in text and '신규 회원' in text and '150,000원' in text
+    assert choices[0].startswith('확정 ')
+    text, _ = say(choices[0])
+    assert '주문앱에는 보내지 않았습니다' in text and api.create.await_count == 0
 
 
-def test_unit_and_customer_authorization():
-    cfg = configuration()
-    p = parse_order(data()['userRequest']['utterance'])
-    b = cfg['bindings']['u1']
-    assert build_order(p, b, cfg, catalog())[0]['request']['items'][0]['quantity'] == 300
-    p['items'][0]['unit'] = '병'
-    with pytest.raises(OrderError):
-        build_order(p, b, cfg, catalog())
-    p['items'][0]['unit'] = '박스'
-    with pytest.raises(OrderError):
-        build_order(p, {**b, 'allowed_partner_ids': []}, cfg, catalog())
+def test_wrong_answer_reasks_same_question(api):
+    say(ORDER)
+    text, choices = say('동부')
+    assert '남부, 중부, 서부' in text and choices == ['남부', '중부', '서부']
 
 
-class MemoryStore:
-    """Test-only substitute. Production always uses PostgreSQL."""
-    def __init__(self):
-        self.rows = {}
-
-    async def draft(self, owner, fingerprint, payload, preview, identifier):
-        old = next((r for r in self.rows.values() if r['fingerprint'] == fingerprint), None)
-        if old:
-            return copy.deepcopy(old)
-        row = dict(id=identifier, owner=owner, fingerprint=fingerprint, payload=payload, preview=preview,
-                   status='draft', fresh=True)
-        self.rows[identifier] = row
-        return copy.deepcopy(row)
-
-    async def get(self, identifier, owner):
-        row = self.rows.get(identifier)
-        return copy.deepcopy(row) if row and row['owner'] == owner else None
-
-    async def claim(self, identifier, owner):
-        row = self.rows.get(identifier)
-        if row and row['owner'] == owner and row['status'] == 'draft' and row['fresh']:
-            row['status'] = 'posting'
-            return copy.deepcopy(row)
-
-    async def finish(self, identifier, owner, status, order_no=None):
-        self.rows[identifier].update(status=status, order_no=order_no)
-
-    async def cancel(self, identifier, owner):
-        row = self.rows.get(identifier)
-        if row and row['owner'] == owner and row['status'] == 'draft':
-            row['status'] = 'cancelled'
+def test_profile_is_offered_and_proxy_order_asks_again(api):
+    complete_new_orderer()
+    text, choices = say('2099-11-10, 1급진간장 1.8L 12박스, 청운초등학교, 남부')
+    assert '홍길동 님(010-1234-5678)인가요' in text and choices == ['네', '다른 분 주문']
+    text, _ = say('다른 분 주문')
+    assert '주문자 성함과 전화번호' in text
+    text, _ = say('이용식 010-2778-1400')
+    assert '받는분: 함은숙' in text  # existing member: church comes from the member
 
 
-@pytest.fixture
-def live(monkeypatch):
-    monkeypatch.setenv('DRY_RUN', 'false')
-    monkeypatch.setenv('RECEIVER_DATABASE_URL', 'unused-mocked-database')
-    monkeypatch.setenv('ORDER_CONFIG_JSON', json.dumps(configuration()))
-    state = MemoryStore()
-    monkeypatch.setattr(main, 'store', state)
-    api = AsyncMock()
-    api.login.return_value = {'Authorization': 'Bearer fake'}
-    api.catalog.return_value = catalog()
-    api.create.return_value = httpx.Response(201, json={'id': 9, 'userId': 123, 'orderNumber': 'SYN0123456789'})
-    monkeypatch.setattr(main, 'Backend', lambda: api)
-    return state, api
+def test_ambiguous_product_choice(api):
+    text, choices = say('2099-11-10, 간장 360ml 2박스, 청운초등학교')
+    assert choices == ['1', '2'] and '진간장 360mL(박스)' in text
+    text, _ = say('2')
+    assert '매장' in text
 
 
-def draft_id():
-    response = CLIENT.post('/kakao/order', headers=HEADERS, json=data())
-    assert response.status_code == 200, response.text
-    return response.json()['template']['quickReplies'][0]['messageText'].split()[1]
+def test_unknown_product_reasks(api):
+    text, _ = say('2099-11-10, 고추장 2박스, 청운초등학교')
+    assert '찾지 못했습니다' in text
+    text, _ = say('진간장 360ml 2박스')
+    assert '매장' in text
 
 
-def test_confirm_then_replay_and_payload(live):
+def test_unknown_partner_asks_for_recipient(api):
+    text, _ = say('2099-11-10, 진간장 360ml 2박스, 신선유통, 남부, 이용식 010-2778-1400')
+    assert '거래처관리에' in text and '성함, 연락처, 주소' in text
+    say('김철수 010-3333-4444 부산 해운대구 1')
+    text, choices = say('배달')
+    assert '배달 시간' in text
+    text, choices = say('오전 10시')
+    assert '김철수' in text and choices[0].startswith('확정 ')
+
+
+def test_cancel_words_clear_session(api):
+    say(ORDER)
+    text, _ = say('취소')
+    assert '취소했습니다' in text
+    text, _ = say('중부')
+    assert '주문 내용을 보내 주세요' in text
+
+
+def test_new_full_order_replaces_session(api):
+    say(ORDER)
+    text, _ = say('2099-11-12, 진간장 360ml 2박스, 청운초등학교')
+    assert '매장' in text
+
+
+# ---------------------------------------------------------------- submission
+
+def decode_lines(notes):
+    blob = notes.split('배송상세:')[1]
+    return json.loads(base64.urlsafe_b64decode(blob + '=' * (-len(blob) % 4)))['lines']
+
+
+def test_existing_member_delivery_payload(live):
     state, api = live
-    identifier = draft_id()
-    assert api.create.await_count == 0
-    response = CLIENT.post('/kakao/order', headers=HEADERS, json=data('확정 ' + identifier))
-    assert 'SYN0123456789' in message(response)
-    CLIENT.post('/kakao/order', headers=HEADERS, json=data('확정 ' + identifier))
-    CLIENT.post('/kakao/order', headers=HEADERS, json=data())
-    assert api.create.await_count == 1
+    say('2099-11-10, 진간장 360ml 2박스, 청운초등학교, 남부, 배달, 오전 10시, 주문자: 이용식 010-2778-1400')
+    _, choices = say('맞아요')
+    text, _ = say(choices[0])
+    assert 'SYN0123456789' in text
     payload = api.create.call_args.args[2]
-    assert payload['userId'] == 123 and payload['items'][0]['quantity'] == 300
-    assert payload['totalAmount'] == 30000
+    assert payload['userId'] == 55 and 'ordererProfile' not in payload
+    assert payload['items'] == [{'productName': '* 진간장 360mL(박스)', 'quantity': 2, 'price': 12000.0}]
+    assert payload['totalAmount'] == 24000
+    notes = payload['notes']
+    for segment in ('주문자:이용식관', '연락처:010-2778-1400', '중앙:서대문남', '배달업체명:청운초등학교',
+                    '배달일:2099-11-10 오전 10:00', '받는분:함은숙 / 010-1111-2222 / 서울 종로구 자하문로 1',
+                    '주문작업지역:남부(기장)', '지부매장:남부(기장)', '인사장종류:없음',
+                    '[배달] * 진간장 360mL(박스) 2개'):
+        assert segment in notes
+    assert payload['shipment'] == {'fulfillmentType': 'PARCEL', 'carrier': '청운초등학교',
+                                   'deliveryAddress': '서울 종로구 자하문로 1',
+                                   'estimatedWindow': '2099-11-10T10:00:00.000Z'}
+    line = decode_lines(notes)[0]
+    assert line['product'] == '* 진간장 360mL(박스)' and line['ship']['deliveryTime'] == '10:00'
+    assert payload['extraNote'].startswith('카카오접수:')
 
 
-def test_other_user_cannot_confirm(live, monkeypatch):
+def test_new_orderer_parcel_payload(live):
     state, api = live
-    identifier = draft_id()
-    cfg = configuration()
-    cfg['bindings']['u2'] = {**cfg['bindings']['u1'], 'userId': 456}
-    monkeypatch.setenv('ORDER_CONFIG_JSON', json.dumps(cfg))
-    main.config.cache_clear()
-    r = CLIENT.post('/kakao/order', headers=HEADERS, json=data('확정 '+identifier, 'u2'))
-    assert '찾지 못했습니다' in message(r) and api.create.await_count == 0
+    api.create.return_value = httpx.Response(201, json={'id': 10, 'userId': 99, 'orderNumber': 'SYN0000000010'})
+    text, choices = complete_new_orderer()
+    text, _ = say(choices[0])
+    assert 'SYN0000000010' in text
+    payload = api.create.call_args.args[2]
+    assert payload['userId'] == 1
+    assert payload['ordererProfile'] == {'fullname': '홍길동', 'phone': '010-1234-5678', 'churchId': 3}
+    assert '택배발송일:2099-11-10' in payload['notes'] and '주문작업지역:중부(덕소)' in payload['notes']
+    assert '보내는사람:홍길동 / 010-1234-5678 / 서울 종로구 자하문로 1' in payload['notes']
+    assert payload['shipment']['estimatedWindow'] == '2099-11-10T09:00:00.000Z'
+
+
+def test_confirm_replay_and_duplicate_order(live):
+    state, api = live
+    text, choices = complete_new_orderer()
+    say(choices[0])
+    say(choices[0])
+    assert api.create.await_count == 1
+
+
+def test_other_user_cannot_confirm(live):
+    state, api = live
+    _, choices = complete_new_orderer()
+    text, _ = say(choices[0], owner='u2')
+    assert '찾지 못했습니다' in text and api.create.await_count == 0
 
 
 def test_timeout_never_reposts(live):
     state, api = live
-    identifier = draft_id()
     api.create.side_effect = httpx.ReadTimeout('simulated')
-    r = CLIENT.post('/kakao/order', headers=HEADERS, json=data('확정 '+identifier))
-    assert '확인이 필요' in message(r)
-    CLIENT.post('/kakao/order', headers=HEADERS, json=data('확정 '+identifier))
+    _, choices = complete_new_orderer()
+    text, _ = say(choices[0])
+    assert '확인이 필요' in text
+    say(choices[0])
+    identifier = choices[0].split()[1]
     assert api.create.await_count == 1 and state.rows[identifier]['status'] == 'unknown'
 
 
 def test_expired_draft(live):
     state, api = live
-    identifier = draft_id()
-    state.rows[identifier]['fresh'] = False
-    r = CLIENT.post('/kakao/order', headers=HEADERS, json=data('확정 '+identifier))
-    assert '만료' in message(r) and api.create.await_count == 0
+    _, choices = complete_new_orderer()
+    state.rows[choices[0].split()[1]]['fresh'] = False
+    text, _ = say(choices[0])
+    assert '만료' in text and api.create.await_count == 0
 
 
 def test_cancelled_draft(live):
     state, api = live
-    identifier = draft_id()
-    CLIENT.post('/kakao/order', headers=HEADERS, json=data('취소 '+identifier))
-    CLIENT.post('/kakao/order', headers=HEADERS, json=data('확정 '+identifier))
+    _, choices = complete_new_orderer()
+    say(choices[1])
+    say(choices[0])
     assert api.create.await_count == 0
 
 
 def test_concurrent_confirm_claims_once(live):
     state, api = live
-    identifier = draft_id()
+    _, choices = complete_new_orderer()
+    body = main.SkillRequest.model_validate({'userRequest': {'utterance': choices[0], 'user': {'id': 'u1'}}})
+
     async def run():
-        body = main.SkillRequest.model_validate(data('확정 '+identifier))
         return await asyncio.gather(main.process(body), main.process(body))
     asyncio.run(run())
     assert api.create.await_count == 1
 
 
-def test_delivery_contract(live):
-    state, api = live
-    identifier = draft_id()
-    CLIENT.post('/kakao/order', headers=HEADERS, json=data('확정 '+identifier))
-    payload = api.create.call_args.args[2]
-    assert payload['shipment']['deliveryAddress'] == '테스트 주소'
-    assert payload['shipment']['estimatedWindow'] == '2099-10-21T09:00:00+09:00'
-    assert 'carrier' not in payload['shipment']
-    assert 'partnerId' not in payload and 'orderGroupKey' not in payload
-    assert 'orderNumber' not in payload
-    assert '주문작업지역:남부(기장)' in payload['notes']
-    assert '택배발송일:2099-10-21' in payload['notes']
-    assert payload['extraNote'] == '카카오접수:' + identifier
-
-
-def test_shared_partner_creator_is_not_order_owner():
-    cfg = configuration()
-    cfg['partners'][0]['userId'] = 456
-    payload, _ = build_order(parse_order(data()['userRequest']['utterance']), cfg['bindings']['u1'], cfg, catalog())
-    assert payload['request']['userId'] == 123
-
-
-def test_box_cannot_map_to_each_even_if_config_claims_box():
-    cfg = configuration()
-    products = catalog()
-    products[0].update(productName='1급진간장 1.8L (개)', spec='1.8L(개)', unit=1)
-    with pytest.raises(OrderError):
-        build_order(parse_order(data()['userRequest']['utterance']), cfg['bindings']['u1'], cfg, products)
-
-
-def test_catalog_name_ambiguity():
-    cfg = configuration()
-    products = catalog() + [{**catalog()[0], 'code': 'OTHER'}]
-    with pytest.raises(OrderError):
-        build_order(parse_order(data()['userRequest']['utterance']), cfg['bindings']['u1'], cfg, products)
-
-
-def test_example_total_is_calculated():
-    cfg = configuration()
-    cfg['product_map'] = [{'match': '명진1호', 'input_unit': '박스', 'code': 'A', 'catalog_unit': '박스'},
-                          {'match': 'S5호', 'input_unit': '박스', 'code': 'B', 'catalog_unit': '박스'}]
-    products = [{'code': 'A', 'productName': '명진1호', 'wholesalePrice': 15000},
-                {'code': 'B', 'productName': 'S5호', 'wholesalePrice': 12000}]
-    parsed = parse_order('신선유통, 2099-10-21, 명진1호 300박스, S5호 200박스')
-    payload, _ = build_order(parsed, cfg['bindings']['u1'], cfg, products)
-    assert payload['request']['totalAmount'] == 6900000
-
-
-@pytest.mark.parametrize('status, result', [(202, {'orderNumber': 'pending'}), (200, {'message': 'ok'})])
+@pytest.mark.parametrize('status, result', [
+    (202, {'id': 9, 'userId': 99, 'orderNumber': 'SYN1'}),
+    (201, {'id': 9, 'userId': 99}),
+    (201, {'id': 0, 'userId': 99, 'orderNumber': 'SYN1'}),
+    (201, {'id': 9, 'orderNumber': 'SYN1'}),
+])
 def test_unconfirmed_api_response_never_reports_success(live, status, result):
     state, api = live
-    identifier = draft_id()
     api.create.return_value = httpx.Response(status, json=result)
-    r = CLIENT.post('/kakao/order', headers=HEADERS, json=data('확정 '+identifier))
-    assert '확인이 필요' in message(r)
-    CLIENT.post('/kakao/order', headers=HEADERS, json=data('확정 '+identifier))
-    assert api.create.await_count == 1
+    _, choices = complete_new_orderer()
+    text, _ = say(choices[0])
+    assert '접수되었습니다' not in text
 
 
-def test_backend_uses_supplied_origin_and_token(monkeypatch):
-    from backend import Backend
-    monkeypatch.delenv('SANC_API_BASE_URL', raising=False)
-    token = 'test.eyJyb2xlIjoiYWRtaW4ifQ.test'
-    monkeypatch.setenv('SANC_API_TOKEN', token)
-    backend = Backend()
-    assert backend.base == 'https://sanc-logistics-fe.vercel.app'
-    http = AsyncMock()
-    assert asyncio.run(backend.login(http)) == {'Authorization': 'Bearer ' + token}
-    http.post.assert_not_called()
-
-
-def test_api_partner_lookup_and_change_before_confirmation(live, monkeypatch):
+def test_existing_member_response_must_match_owner(live):
     state, api = live
-    cfg = configuration()
-    cfg['partner_source'] = 'api'
-    monkeypatch.setenv('ORDER_CONFIG_JSON', json.dumps(cfg))
-    main.config.cache_clear()
-    api.partners.return_value = copy.deepcopy(cfg['partners'])
-    identifier = draft_id()
-    assert api.partners.await_count == 1
-    api.partners.return_value[0]['address'] = '바뀐 주소'
-    r = CLIENT.post('/kakao/order', headers=HEADERS, json=data('확정 '+identifier))
-    assert '변경' in message(r)
-    api.create.assert_not_called()
-
-
-def test_partner_endpoint_contract():
-    from backend import Backend
-    calls = []
-    def respond(request):
-        calls.append(request)
-        return httpx.Response(200, json=configuration()['partners'])
-    async def run():
-        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
-            return await Backend().partners(http, {'Authorization': 'Bearer test'})
-    assert asyncio.run(run())[0]['id'] == 7
-    assert calls[0].url.path == '/api/partners'
-    assert calls[0].url.query == b''
-    assert calls[0].headers['Authorization'] == 'Bearer test'
+    api.create.return_value = httpx.Response(201, json={'id': 9, 'userId': 77, 'orderNumber': 'SYN1'})
+    say('2099-11-10, 진간장 360ml 2박스, 청운초등학교, 남부, 택배, 주문자: 이용식 010-2778-1400')
+    _, choices = say('맞아요')
+    text, _ = say(choices[0])
+    assert '확인이 필요' in text
 
 
 def test_nonadmin_token_rejected_before_any_order(monkeypatch):
     from backend import Backend
-    monkeypatch.setenv('SANC_API_TOKEN', 'test.eyJyb2xlIjoibWVtYmVyIn0.test')
+    claims = base64.urlsafe_b64encode(json.dumps({'sub': 5, 'role': 'member'}).encode()).decode().rstrip('=')
+    monkeypatch.setenv('SANC_API_TOKEN', f'h.{claims}.s')
     with pytest.raises(ValueError):
-        asyncio.run(Backend().login(AsyncMock()))
+        asyncio.run(Backend().login(None))
 
 
-def test_wrong_owner_response_requires_reconciliation(live):
-    state, api = live
-    identifier = draft_id()
-    api.create.return_value = httpx.Response(201, json={'id': 9, 'userId': 456, 'orderNumber': 'SYN0123456789'})
-    r = CLIENT.post('/kakao/order', headers=HEADERS, json=data('확정 '+identifier))
-    assert '확인이 필요' in message(r)
-    assert state.rows[identifier]['status'] == 'unknown'
+def test_admin_token_gives_admin_id(monkeypatch):
+    from backend import Backend
+    claims = base64.urlsafe_b64encode(json.dumps({'sub': 284, 'role': 'admin'}).encode()).decode().rstrip('=')
+    monkeypatch.setenv('SANC_API_TOKEN', f'h.{claims}.s')
+    api = Backend()
+    asyncio.run(api.login(None))
+    assert api.admin_id == 284 and api.base == 'https://be-aosm.onrender.com'
