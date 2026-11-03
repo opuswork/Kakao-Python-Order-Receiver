@@ -9,6 +9,7 @@ import os
 import re
 import uuid
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -265,5 +266,19 @@ async def receive(request: Request):
         return reply('처리 시간이 초과되었습니다. 확정 중이었다면 같은 확정 버튼으로 결과를 확인해 주세요. 새 주문으로 다시 입력하지 마세요.')
     except Exception as exc:
         # Do not log access tokens, customer addresses, request bodies or database URLs.
-        logger.error('receiver_failure type=%s', type(exc).__name__)
-        return reply('처리 중 오류가 발생했습니다. 접수 완료로 처리하지 않았습니다. 확정 중이었다면 담당자에게 실제 주문 목록 확인을 요청해 주세요.')
+        code = error_code(exc)
+        logger.error('receiver_failure code=%s', code)
+        return reply('처리 중 오류가 발생했습니다. 접수 완료로 처리하지 않았습니다. 확정 중이었다면 담당자에게 실제 주문 목록 확인을 요청해 주세요.'
+                     f'\n(오류 코드: {code})')
+
+
+def error_code(exc):
+    """Short, secret-free cause shown to the user so failures can be diagnosed without server logs."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f'{type(exc).__name__} {exc.response.status_code} {exc.request.url.path}'
+    if isinstance(exc, httpx.RequestError):
+        try:
+            return f'{type(exc).__name__} {exc.request.url.path}'
+        except RuntimeError:  # No request attached.
+            pass
+    return type(exc).__name__
