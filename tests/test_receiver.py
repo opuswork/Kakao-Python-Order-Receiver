@@ -185,10 +185,13 @@ def test_catalog_names_with_bare_units_and_tong():
     catalog = [{'code': 'F', 'productName': '생명물간장 860mL(박스)', 'category': '일반품'},
                {'code': 'G', 'productName': '생명물간장 120mL(70개입)박스', 'category': '일반품'},
                {'code': 'H', 'productName': '1급진간장 500mL박스', 'category': '일반품'},
-               {'code': 'I', 'productName': '* 생명물간장 13L(개)', 'category': '일반품'}]
+               {'code': 'I', 'productName': '* 생명물간장 13L(개)', 'category': '일반품'},
+               {'code': 'J', 'productName': '* 생명물간장 120mL(16개입)', 'spec': '120mL(통)', 'category': '일반품'},
+               {'code': 'K', 'productName': '* 생명물간장 860mL(개)', 'category': '일반품', 'openStock': False}]
     codes = lambda name, unit: [p['code'] for p in match_products(catalog, {'name': name, 'unit': unit})]
     assert codes('생명물간장 860ml', '통') == ['F']
-    assert codes('생명물간장 120ml', '박스') == codes('생명물간장 120ml', '통') == ['G']
+    assert codes('생명물간장 120ml', '박스') == ['G']
+    assert codes('생명물간장 120ml', '통') == ['G', 'J']  # Asks which one.
     assert codes('1급진간장 500ml', '박스') == ['H']
     assert codes('생명물간장 13L', '통') == ['I']
     assert codes('생명물간장 860ml', '병') == []
