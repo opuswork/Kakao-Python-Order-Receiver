@@ -3,11 +3,22 @@ import math
 import os
 import base64
 import json
+import time
+
 import httpx
+
+# Tokens live 24h (JWT_EXPIRES_SECONDS). Refresh a cached one in its last 6 hours.
+REFRESH_BEFORE = 6 * 3600
 
 
 class ConfigError(RuntimeError):
     """Missing deployment setting. The message is safe to show to users (no values)."""
+
+
+def claims(token):
+    """JWT payload without verification; the backend verifies the signature."""
+    segment = token.split('.')[1]
+    return json.loads(base64.urlsafe_b64decode(segment + '=' * (-len(segment) % 4)))
 
 
 class Backend:
@@ -17,20 +28,34 @@ class Backend:
             raise ValueError('SANC_API_BASE_URL must use HTTPS')
         self.admin_id = None
 
-    async def login(self, client):
+    async def login(self, client, cache=None):
+        """Admin headers. cache (storage) keeps the JWT so each message does not log in again:
+        every backend login posts an announcement to the admin live chat."""
         token = os.getenv('SANC_API_TOKEN', '').strip()
         if token:
-            # Configuration sanity check only; the backend verifies the signature.
+            # Configuration sanity check only.
             # Its service overrides userId for non-admins, so fail before any write.
             try:
-                segment = token.split('.')[1]
-                claims = json.loads(base64.urlsafe_b64decode(segment + '=' * (-len(segment) % 4)))
-                if str(claims.get('role', '')).lower() != 'admin':
+                payload = claims(token)
+                if str(payload.get('role', '')).lower() != 'admin':
                     raise ValueError()
-                self.admin_id = int(claims['sub'])
+                self.admin_id = int(payload['sub'])
             except Exception:
                 raise ConfigError('SANC_API_TOKEN이 관리자 토큰이 아님') from None
             return {'Authorization': 'Bearer ' + token}
+        cached = await cache.token() if cache is not None else None
+        if cached:
+            try:
+                payload = claims(cached)
+                left = float(payload['exp']) - time.time()
+                admin_id = int(payload['sub'])
+            except Exception:
+                left = 0
+            if left > 60:
+                self.admin_id = admin_id
+                if left < REFRESH_BEFORE:
+                    cached = await self.refresh(client, cached, cache)
+                return {'Authorization': 'Bearer ' + cached}
         login_id, password = os.getenv('SANC_LOGIN_ID', ''), os.getenv('SANC_LOGIN_PW', '')
         if not (login_id and password):
             raise ConfigError('SANC_API_TOKEN 없음')
@@ -41,7 +66,21 @@ class Backend:
         if str(data.get('user', {}).get('role', '')).lower() != 'admin':
             raise ValueError('Use an authorized admin automation account')
         self.admin_id = int(data['user']['id'])
+        if cache is not None:
+            await cache.save_token(data['accessToken'])
         return {'Authorization': 'Bearer ' + data['accessToken']}
+
+    async def refresh(self, client, token, cache):
+        """Sliding renewal (POST /api/auth/refresh). Best effort: the old token is still valid."""
+        try:
+            r = await client.post(self.base + '/api/auth/refresh', headers={'Authorization': 'Bearer ' + token})
+            r.raise_for_status()
+            renewed = r.json()['accessToken']
+            claims(renewed)
+        except Exception:
+            return token
+        await cache.save_token(renewed)
+        return renewed
 
     async def catalog(self, client, headers):
         r = await client.get(self.base + '/api/stock-inventory', headers=headers)

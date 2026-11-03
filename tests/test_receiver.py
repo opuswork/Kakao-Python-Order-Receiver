@@ -405,3 +405,70 @@ def test_admin_token_gives_admin_id(monkeypatch):
     api = Backend()
     asyncio.run(api.login(None))
     assert api.admin_id == 284 and api.base == 'https://be-aosm.onrender.com'
+
+
+def jwt(**payload):
+    body = base64.urlsafe_b64encode(json.dumps({'sub': 7, 'role': 'admin', **payload}).encode()).decode().rstrip('=')
+    return f'h.{body}.s'
+
+
+def answer(path, status, data):
+    return httpx.Response(status, json=data, request=httpx.Request('POST', 'https://be-aosm.onrender.com' + path))
+
+
+@pytest.fixture
+def account(monkeypatch):
+    monkeypatch.delenv('SANC_API_TOKEN', raising=False)
+    monkeypatch.setenv('SANC_LOGIN_ID', 'bot')
+    monkeypatch.setenv('SANC_LOGIN_PW', 'pw')
+    from backend import Backend
+    return Backend(), MemoryStore(), AsyncMock()
+
+
+def test_login_once_then_reuse_cached_token(account):
+    import time
+    api, cache, http = account
+    token = jwt(exp=time.time() + 20 * 3600)
+    http.post.return_value = answer('/api/auth/login', 200, {'accessToken': token, 'user': {'id': 7, 'role': 'admin'}})
+    first = asyncio.run(api.login(http, cache))
+    second = asyncio.run(api.login(http, cache))
+    assert first == second == {'Authorization': 'Bearer ' + token}
+    assert http.post.call_count == 1 and asyncio.run(cache.token()) == token and api.admin_id == 7
+
+
+def test_cached_token_near_expiry_is_refreshed(account):
+    import time
+    api, cache, http = account
+    old, new = jwt(exp=time.time() + 3600), jwt(exp=time.time() + 24 * 3600)
+    asyncio.run(cache.save_token(old))
+    http.post.return_value = answer('/api/auth/refresh', 200, {'accessToken': new})
+    assert asyncio.run(api.login(http, cache)) == {'Authorization': 'Bearer ' + new}
+    assert http.post.call_args.args[0].endswith('/api/auth/refresh') and asyncio.run(cache.token()) == new
+
+
+def test_failed_refresh_keeps_valid_token(account):
+    import time
+    api, cache, http = account
+    old = jwt(exp=time.time() + 3600)
+    asyncio.run(cache.save_token(old))
+    http.post.return_value = answer('/api/auth/refresh', 500, {})
+    assert asyncio.run(api.login(http, cache)) == {'Authorization': 'Bearer ' + old}
+    assert asyncio.run(cache.token()) == old
+
+
+def test_expired_cached_token_logs_in_again(account):
+    import time
+    api, cache, http = account
+    asyncio.run(cache.save_token(jwt(exp=time.time() - 10)))
+    fresh = jwt(exp=time.time() + 24 * 3600)
+    http.post.return_value = answer('/api/auth/login', 200, {'accessToken': fresh, 'user': {'id': 7, 'role': 'admin'}})
+    asyncio.run(api.login(http, cache))
+    assert http.post.call_args.args[0].endswith('/api/auth/login') and asyncio.run(cache.token()) == fresh
+
+
+def test_rejected_token_is_forgotten(api):
+    asyncio.run(main.memory.save_token('stale'))
+    request = httpx.Request('GET', 'https://be-aosm.onrender.com/api/stock-inventory')
+    api.catalog.side_effect = httpx.HTTPStatusError('401', request=request, response=httpx.Response(401, request=request))
+    text, _ = say(ORDER)
+    assert '401 /api/stock-inventory' in text and asyncio.run(main.memory.token()) is None
